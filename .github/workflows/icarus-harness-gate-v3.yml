@@ -1,0 +1,72 @@
+name: icarus-harness-gate-v3
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "task_queue/**"
+      - "harness-runner-v3.py"
+      - "icarus_pilot.py"
+      - "schemas/**"
+      - "tests/**"
+      - ".github/workflows/icarus-harness-gate-v3.yml"
+  schedule:
+    # GitHub fires schedules from the default branch only.
+    - cron: "23 * * * *"
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: icarus-harness-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Harness self-tests (Tier 1 machine verifier)
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Ledger integrity precheck
+        run: python3 harness-runner-v3.py --verify-ledger
+
+      - name: Dispatch queue
+        id: pilot
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          python3 icarus_pilot.py | tee "$RUNNER_TEMP/pilot.json"
+          echo "rc=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Commit receipts and archive
+        if: always()
+        run: |
+          git config user.name "icarus-harness[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A icarus/runs processed task_queue
+          if git diff --cached --quiet; then
+            echo "Nothing to commit (queue was empty)."
+            exit 0
+          fi
+          git commit -m "icarus: receipt(s) from run ${GITHUB_RUN_ID} [executed at ${GITHUB_SHA}]"
+          for i in 1 2 3 4; do
+            git push origin "HEAD:${GITHUB_REF_NAME}" && break
+            sleep $((2 ** i)); git pull --rebase origin "${GITHUB_REF_NAME}"
+          done
+          echo "receipt_commit=$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post-commit ledger readback
+        if: always()
+        run: python3 harness-runner-v3.py --verify-ledger
+
+      - name: Enforce gate result
+        if: always()
+        run: test "${{ steps.pilot.outputs.rc }}" = "0"
